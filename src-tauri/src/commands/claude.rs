@@ -750,11 +750,26 @@ fn should_use_sidecar(claude_path: &str) -> bool {
     claude_path == "claude-code"
 }
 
+/// Returns a copy of `args` with the prompt inserted right after the `-p` flag.
+///
+/// Used by the macOS sidecar path: the sidecar command has no way to close the
+/// child's stdin, so the prompt has to travel as an argument there.
+#[cfg(target_os = "macos")]
+fn with_prompt_arg(args: &[String], prompt: &str) -> Vec<String> {
+    let mut result = args.to_vec();
+    match result.iter().position(|arg| arg == "-p") {
+        Some(index) => result.insert(index + 1, prompt.to_string()),
+        None => result.push(prompt.to_string()),
+    }
+    result
+}
+
 /// Creates a sidecar command with the given arguments
 fn create_sidecar_command(
     app: &AppHandle,
     args: Vec<String>,
     project_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<tauri_plugin_shell::process::Command, String> {
     let mut sidecar_cmd = app
         .shell()
@@ -912,6 +927,7 @@ fn create_system_command_with_env(
     }
 
     cmd.current_dir(project_path)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -1222,7 +1238,12 @@ pub async fn check_claude_version(app: AppHandle) -> Result<ClaudeVersionStatus,
         let temp_dir = std::env::temp_dir();
 
         // Create sidecar command with --version flag
-        let sidecar_cmd = match create_sidecar_command(&app, vec!["--version".to_string()], &temp_dir.to_string_lossy()) {
+        let sidecar_cmd = match create_sidecar_command(
+            &app,
+            vec!["--version".to_string()],
+            &temp_dir.to_string_lossy(),
+            &std::collections::HashMap::new(),
+        ) {
             Ok(cmd) => cmd,
             Err(e) => {
                 log::error!("Failed to create sidecar command: {}", e);
@@ -1598,9 +1619,13 @@ pub async fn execute_claude_code(
 
     let claude_path = find_claude_binary(&app)?;
 
+    // The prompt is NOT passed as a command line argument: `claude -p` reads it
+    // from stdin when no positional prompt is given. This avoids the Windows
+    // ~32k command line limit, cmd.exe re-parsing when the CLI is a .cmd shim
+    // (which rejects arguments containing newlines) and prompts that start with
+    // "-" being parsed as options.
     let args = vec![
         "-p".to_string(),
-        prompt.clone(),
         "--model".to_string(),
         model.clone(),
         "--output-format".to_string(),
@@ -1612,12 +1637,21 @@ pub async fn execute_claude_code(
     // On macOS, when the stored path is the special sidecar identifier, use sidecar to spawn
     #[cfg(target_os = "macos")]
     if claude_path == "claude-code" {
-        // TODO: Update sidecar to also use environment variables
-        return spawn_claude_sidecar(app, args, prompt, model, project_path).await;
+        let sidecar_args = with_prompt_arg(&args, &prompt);
+        return spawn_claude_sidecar(
+            app.clone(),
+            sidecar_args,
+            prompt.clone(),
+            model.clone(),
+            project_path.clone(),
+            env_vars.clone(),
+            None,
+        )
+        .await;
     }
 
     let cmd = create_system_command_with_env(&claude_path, args, &project_path, &env_vars);
-    spawn_claude_process(app, cmd, prompt, model, project_path).await
+    spawn_claude_process(app, cmd, prompt, model, project_path, None).await
 }
 
 /// Continue an existing Claude Code conversation with streaming output
@@ -1646,10 +1680,10 @@ pub async fn continue_claude_code(
 
     let claude_path = find_claude_binary(&app)?;
 
+    // Prompt is delivered over stdin - see execute_claude_code.
     let args = vec![
         "-c".to_string(), // Continue flag
         "-p".to_string(),
-        prompt.clone(),
         "--model".to_string(),
         model.clone(),
         "--output-format".to_string(),
@@ -1661,11 +1695,21 @@ pub async fn continue_claude_code(
     // On macOS, when the stored path is the special sidecar identifier, use sidecar to spawn
     #[cfg(target_os = "macos")]
     if claude_path == "claude-code" {
-        return spawn_claude_sidecar(app, args, prompt, model, project_path).await;
+        let sidecar_args = with_prompt_arg(&args, &prompt);
+        return spawn_claude_sidecar(
+            app.clone(),
+            sidecar_args,
+            prompt.clone(),
+            model.clone(),
+            project_path.clone(),
+            env_vars.clone(),
+            None,
+        )
+        .await;
     }
 
     let cmd = create_system_command_with_env(&claude_path, args, &project_path, &env_vars);
-    spawn_claude_process(app, cmd, prompt, model, project_path).await
+    spawn_claude_process(app, cmd, prompt, model, project_path, None).await
 }
 
 /// Resume an existing Claude Code session by ID with streaming output
@@ -1708,11 +1752,11 @@ pub async fn resume_claude_code(
 
     let claude_path = find_claude_binary(&app)?;
 
+    // Prompt is delivered over stdin - see execute_claude_code.
     let args = vec![
         "--resume".to_string(),
         session_id.clone(),
         "-p".to_string(),
-        prompt.clone(),
         "--model".to_string(),
         model.clone(),
         "--output-format".to_string(),
@@ -1721,14 +1765,30 @@ pub async fn resume_claude_code(
         "--dangerously-skip-permissions".to_string(),
     ];
 
+    // The session id is known up front, so it can be used as the event channel
+    // even if the CLI dies before printing its init line. Without this the
+    // frontend (which listens on `claude-complete:<session_id>` after the first
+    // init) would never learn that the run finished.
+    let requested_session_id = Some(session_id.clone());
+
     // On macOS, when the stored path is the special sidecar identifier, use sidecar to spawn
     #[cfg(target_os = "macos")]
     if claude_path == "claude-code" {
-        return spawn_claude_sidecar(app, args, prompt, model, project_path).await;
+        let sidecar_args = with_prompt_arg(&args, &prompt);
+        return spawn_claude_sidecar(
+            app.clone(),
+            sidecar_args,
+            prompt.clone(),
+            model.clone(),
+            project_path.clone(),
+            env_vars.clone(),
+            requested_session_id.clone(),
+        )
+        .await;
     }
 
     let cmd = create_system_command_with_env(&claude_path, args, &project_path, &env_vars);
-    spawn_claude_process(app, cmd, prompt, model, project_path).await
+    spawn_claude_process(app, cmd, prompt, model, project_path, requested_session_id).await
 }
 
 /// Cancel the currently running Claude Code execution
@@ -1893,8 +1953,15 @@ pub async fn get_claude_session_output(
 }
 
 /// Helper function to spawn Claude process and handle streaming
-async fn spawn_claude_process(app: AppHandle, mut cmd: Command, prompt: String, model: String, project_path: String) -> Result<(), String> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+async fn spawn_claude_process(
+    app: AppHandle,
+    mut cmd: Command,
+    prompt: String,
+    model: String,
+    project_path: String,
+    requested_session_id: Option<String>,
+) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use std::sync::Mutex;
 
     // Spawn the process
@@ -1905,6 +1972,25 @@ async fn spawn_claude_process(app: AppHandle, mut cmd: Command, prompt: String, 
     // Get stdout and stderr
     let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
     let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
+
+    // The prompt travels over stdin (`claude -p` with no positional prompt reads
+    // it from there). Writing it and dropping the handle sends EOF, which keeps
+    // the prompt out of the command line entirely.
+    if let Some(mut stdin) = child.stdin.take() {
+        let prompt_for_stdin = prompt.clone();
+        tokio::spawn(async move {
+            if let Err(e) = stdin.write_all(prompt_for_stdin.as_bytes()).await {
+                log::error!("Failed to write prompt to Claude stdin: {}", e);
+            }
+            if let Err(e) = stdin.flush().await {
+                log::error!("Failed to flush Claude stdin: {}", e);
+            }
+            // Dropping stdin closes the pipe so the CLI starts working.
+        });
+    } else {
+        log::error!("Failed to open Claude stdin - the prompt cannot be delivered");
+        return Err("Failed to open Claude stdin".to_string());
+    }
 
     // Get the child PID for logging
     let pid = child.id().unwrap_or(0);
@@ -1917,8 +2003,10 @@ async fn spawn_claude_process(app: AppHandle, mut cmd: Command, prompt: String, 
     let stdout_reader = BufReader::new(stdout);
     let stderr_reader = BufReader::new(stderr);
 
-    // We'll extract the session ID from Claude's init message
-    let session_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // We'll extract the session ID from Claude's init message. When the caller
+    // already knows it (a resumed session) it is used as the fallback channel so
+    // that a process which dies before printing init still reports completion.
+    let session_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(requested_session_id));
     let run_id_holder: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
 
     // Store the child process in the global state (for backward compatibility)
@@ -1951,20 +2039,45 @@ async fn spawn_claude_process(app: AppHandle, mut cmd: Command, prompt: String, 
             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
                 if msg["type"] == "system" && msg["subtype"] == "init" {
                     if let Some(claude_session_id) = msg["session_id"].as_str() {
-                        let mut session_id_guard = match session_id_holder_clone.lock() {
-                            Ok(guard) => guard,
+                        // Adopt the id reported by the CLI. When the caller already
+                        // knows it (a resumed session) that one stays authoritative:
+                        // the frontend listens on it and `cancel_claude_execution`
+                        // looks the process up by it.
+                        match session_id_holder_clone.lock() {
+                            Ok(mut session_id_guard) => {
+                                if session_id_guard.is_none() {
+                                    log::info!("Extracted Claude session ID: {}", claude_session_id);
+                                    *session_id_guard = Some(claude_session_id.to_string());
+                                } else if session_id_guard.as_deref() != Some(claude_session_id) {
+                                    log::debug!(
+                                        "Claude reported session ID {} while {} was requested",
+                                        claude_session_id,
+                                        session_id_guard.as_deref().unwrap_or("")
+                                    );
+                                }
+                            }
                             Err(e) => {
                                 error_log!("Failed to lock session_id_holder: {}", e);
                                 return;
                             }
-                        };
-                        if session_id_guard.is_none() {
-                            *session_id_guard = Some(claude_session_id.to_string());
-                            log::info!("Extracted Claude session ID: {}", claude_session_id);
+                        }
 
-                            // Now register with ProcessRegistry using Claude's session ID
+                        // Register with the ProcessRegistry exactly once, even
+                        // when the session id was already known up front.
+                        let already_registered = match run_id_holder_clone.lock() {
+                            Ok(guard) => guard.is_some(),
+                            Err(e) => {
+                                error_log!("Failed to lock run_id_holder: {}", e);
+                                return;
+                            }
+                        };
+                        if !already_registered {
+                            let tracked_session_id = match session_id_holder_clone.lock() {
+                                Ok(guard) => guard.clone().unwrap_or_default(),
+                                Err(_) => String::new(),
+                            };
                             match registry_clone.register_claude_session(
-                                claude_session_id.to_string(),
+                                tracked_session_id,
                                 pid,
                                 project_path_clone.clone(),
                                 prompt_clone.clone(),
@@ -1972,14 +2085,13 @@ async fn spawn_claude_process(app: AppHandle, mut cmd: Command, prompt: String, 
                             ) {
                                 Ok(run_id) => {
                                     log::info!("Registered Claude session with run_id: {}", run_id);
-                                    let mut run_id_guard = match run_id_holder_clone.lock() {
-                                        Ok(guard) => guard,
+                                    match run_id_holder_clone.lock() {
+                                        Ok(mut run_id_guard) => *run_id_guard = Some(run_id),
                                         Err(e) => {
                                             error_log!("Failed to lock run_id_holder: {}", e);
                                             return;
                                         }
-                                    };
-                                    *run_id_guard = Some(run_id);
+                                    }
                                 }
                                 Err(e) => {
                                     log::error!("Failed to register Claude session: {}", e);
@@ -2098,11 +2210,13 @@ async fn spawn_claude_sidecar(
     prompt: String,
     model: String,
     project_path: String,
+    env_vars: std::collections::HashMap<String, String>,
+    requested_session_id: Option<String>,
 ) -> Result<(), String> {
     use std::sync::Mutex;
 
     // Create the sidecar command
-    let sidecar_cmd = create_sidecar_command(&app, args, &project_path)?;
+    let sidecar_cmd = create_sidecar_command(&app, args, &project_path, &env_vars)?;
 
     // Spawn the sidecar process
     let (mut rx, child) = sidecar_cmd
@@ -2113,8 +2227,10 @@ async fn spawn_claude_sidecar(
     let pid = child.pid();
     log::info!("Spawned Claude sidecar process with PID: {:?}", pid);
 
-    // We'll extract the session ID from Claude's init message
-    let session_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // We'll extract the session ID from Claude's init message. When the caller
+    // already knows it (a resumed session) it is used as the fallback channel so
+    // that a process which dies before printing init still reports completion.
+    let session_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(requested_session_id));
     let run_id_holder: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
 
     // Register with ProcessRegistry
@@ -2145,26 +2261,37 @@ async fn spawn_claude_sidecar(
                                 if let Some(claude_session_id) = msg["session_id"].as_str() {
                                     if let Ok(mut session_id_guard) = session_id_holder_clone.lock() {
                                         if session_id_guard.is_none() {
+                                            log::info!("Extracted Claude sidecar session ID: {}", claude_session_id);
                                             *session_id_guard = Some(claude_session_id.to_string());
-                                            log::info!("Extracted Claude session ID: {}", claude_session_id);
+                                        }
+                                    }
 
-                                            // Register with ProcessRegistry using Claude's session ID
-                                            match registry_clone.register_claude_session(
-                                                claude_session_id.to_string(),
-                                                pid,
-                                                project_path_clone.clone(),
-                                                prompt_clone.clone(),
-                                                model_clone.clone(),
-                                            ) {
-                                                Ok(run_id) => {
-                                                    log::info!("Registered Claude sidecar session with run_id: {}", run_id);
-                                                    if let Ok(mut run_id_guard) = run_id_holder_clone.lock() {
-                                                        *run_id_guard = Some(run_id);
-                                                    }
+                                    // Register with the ProcessRegistry exactly once,
+                                    // even when the session id was known up front.
+                                    let already_registered = match run_id_holder_clone.lock() {
+                                        Ok(guard) => guard.is_some(),
+                                        Err(_) => true,
+                                    };
+                                    if !already_registered {
+                                        let tracked_session_id = match session_id_holder_clone.lock() {
+                                            Ok(guard) => guard.clone().unwrap_or_default(),
+                                            Err(_) => String::new(),
+                                        };
+                                        match registry_clone.register_claude_session(
+                                            tracked_session_id,
+                                            pid,
+                                            project_path_clone.clone(),
+                                            prompt_clone.clone(),
+                                            model_clone.clone(),
+                                        ) {
+                                            Ok(run_id) => {
+                                                log::info!("Registered Claude sidecar session with run_id: {}", run_id);
+                                                if let Ok(mut run_id_guard) = run_id_holder_clone.lock() {
+                                                    *run_id_guard = Some(run_id);
                                                 }
-                                                Err(e) => {
-                                                    log::error!("Failed to register Claude sidecar session: {}", e);
-                                                }
+                                            }
+                                            Err(e) => {
+                                                log::error!("Failed to register Claude sidecar session: {}", e);
                                             }
                                         }
                                     }

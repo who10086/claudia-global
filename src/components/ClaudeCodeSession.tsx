@@ -1050,7 +1050,11 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
       }
     } catch (err) {
       logger.error("Failed to send prompt:", err);
-      setError("Failed to send prompt");
+      // Surface the backend message: it carries the actionable reason (invalid
+      // session id, spawn failure, ...) instead of a generic "failed".
+      const message =
+        typeof err === "string" ? err : err instanceof Error ? err.message : String(err);
+      setError(`Failed to send prompt: ${message}`);
       setIsLoading(false);
       hasActiveSessionRef.current = false;
     }
