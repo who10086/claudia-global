@@ -10,7 +10,7 @@ mod process;
 use checkpoint::state::CheckpointState;
 use commands::agents::{
     cleanup_finished_processes, create_agent, delete_agent, delete_native_agents, execute_agent, export_agent,
-    export_agent_to_file, fetch_github_agent_content, fetch_github_agents, get_agent,
+    export_agent_to_file, export_native_agent_to_file, fetch_github_agent_content, fetch_github_agents, get_agent,
     get_agent_run, get_agent_run_with_real_time_metrics, get_claude_binary_path, refresh_claude_binary_path,
     get_live_session_output, get_session_output, get_session_status, import_agent,
     import_agent_from_file, import_agent_from_github, import_native_agents, init_database, kill_agent_session,
@@ -221,6 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             list_claude_installations,
             export_agent,
             export_agent_to_file,
+            export_native_agent_to_file,
             import_agent,
             import_agent_from_file,
             fetch_github_agents,

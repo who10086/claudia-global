@@ -2089,6 +2089,86 @@ pub async fn export_agent_to_file(
     Ok(())
 }
 
+/// Export a native agent (a markdown file in ~/.claude/agents) to a file
+///
+/// Native agents are not stored in the database, so they cannot be exported by
+/// id. The agent is located by its display name, which is the name declared in
+/// the markdown frontmatter and the value shown in the UI.
+#[tauri::command]
+pub async fn export_native_agent_to_file(name: String, file_path: String) -> Result<(), String> {
+    info!("Exporting native agent '{}' to {}", name, file_path);
+
+    let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
+    let agents_dir = home_dir.join(".claude").join("agents");
+
+    if !agents_dir.exists() {
+        return Err("No native agents directory found (~/.claude/agents)".to_string());
+    }
+
+    let entries =
+        std::fs::read_dir(&agents_dir).map_err(|e| format!("Failed to read agents directory: {}", e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
+        let path = entry.path();
+
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                warn!("Failed to read native agent {}: {}", file_name, e);
+                continue;
+            }
+        };
+
+        match parse_agent_markdown(&content, file_name) {
+            Ok((agent_name, description, system_prompt, icon, _color)) => {
+                if agent_name != name {
+                    continue;
+                }
+
+                let export_data = serde_json::json!({
+                    "version": 1,
+                    "exported_at": chrono::Utc::now().to_rfc3339(),
+                    "agent": {
+                        "name": agent_name,
+                        "icon": icon,
+                        "system_prompt": system_prompt,
+                        "default_task": Some(description),
+                        "model": "claude-3-5-sonnet-20241022",
+                        "hooks": serde_json::Value::Null
+                    }
+                });
+
+                let json_data = serde_json::to_string_pretty(&export_data)
+                    .map_err(|e| format!("Failed to serialize agent: {}", e))?;
+
+                std::fs::write(&file_path, json_data)
+                    .map_err(|e| format!("Failed to write file: {}", e))?;
+
+                info!("Exported native agent '{}'", name);
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Failed to parse native agent file {}: {}", file_name, e);
+            }
+        }
+    }
+
+    Err(format!(
+        "Native agent '{}' was not found in ~/.claude/agents",
+        name
+    ))
+}
+
 /// Get the stored Claude binary path from settings
 #[tauri::command]
 pub async fn get_claude_binary_path(db: State<'_, AgentDb>) -> Result<Option<String>, String> {

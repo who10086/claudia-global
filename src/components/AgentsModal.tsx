@@ -37,7 +37,6 @@ import { api, type Agent, type AgentRunWithMetrics } from "@/lib/api";
 import { useTabState } from "@/hooks/useTabState";
 import { formatISOTimestamp } from "@/lib/date-utils";
 import { open as openDialog, save } from "@tauri-apps/plugin-dialog";
-import { invoke } from "@tauri-apps/api/core";
 import { GitHubAgentBrowser } from "@/components/GitHubAgentBrowser";
 import { useI18n } from "@/lib/i18n";
 
@@ -276,27 +275,39 @@ export const AgentsModal: React.FC<AgentsModalProps> = ({ open, onOpenChange }) 
 
   const handleExportAgent = async (agent: Agent) => {
     try {
-      const exportData = await api.exportAgent(agent.id ?? 0);
+      // Native agents live as markdown files outside the database and are
+      // identified by name; everything else is exported by database id.
+      const isNative = agent.source === "native";
+
       const filePath = await save({
-        defaultPath: `${agent.name.toLowerCase().replace(/\s+/g, "-")}.json`,
+        defaultPath: `${agent.name.toLowerCase().replace(/\s+/g, "-")}.claudia.json`,
         filters: [
           {
-            name: "JSON",
-            extensions: ["json"],
+            name: "Claudia Agent",
+            extensions: ["claudia.json", "json"],
           },
         ],
       });
 
-      if (filePath) {
-        await invoke("write_file", {
-          path: filePath,
-          content: JSON.stringify(exportData, null, 2),
-        });
-        setToast({ message: t.agents.agentExportedSuccessfully, type: "success" });
+      if (!filePath) {
+        // User cancelled the dialog
+        return;
       }
+
+      if (isNative) {
+        await api.exportNativeAgentToFile(agent.name, filePath);
+      } else {
+        await api.exportAgentToFile(agent.id ?? 0, filePath);
+      }
+
+      setToast({ message: t.agents.agentExportedSuccessfully, type: "success" });
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       await handleError("Failed to export agent:", { context: error });
-      setToast({ message: t.agents.failedToExportAgent, type: "error" });
+      setToast({
+        message: `${t.agents.failedToExportAgent}: ${message}`,
+        type: "error",
+      });
     }
   };
 

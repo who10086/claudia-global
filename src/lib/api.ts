@@ -882,6 +882,34 @@ export const api = {
   },
 
   /**
+   * Exports a single agent directly to a file chosen by the user
+   * @param id - The agent ID to export
+   * @param filePath - Destination file path
+   */
+  async exportAgentToFile(id: number, filePath: string): Promise<void> {
+    try {
+      await invoke("export_agent_to_file", { id, filePath });
+    } catch (error) {
+      logger.error("Failed to export agent to file:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Exports a native agent (a markdown file in ~/.claude/agents) to a file
+   * @param name - The native agent display name
+   * @param filePath - Destination file path
+   */
+  async exportNativeAgentToFile(name: string, filePath: string): Promise<void> {
+    try {
+      await invoke("export_native_agent_to_file", { name, filePath });
+    } catch (error) {
+      logger.error("Failed to export native agent to file:", error);
+      throw error;
+    }
+  },
+
+  /**
    * Imports an agent from JSON data
    * @param jsonData - The JSON string containing the agent export
    * @returns Promise resolving to the imported agent
