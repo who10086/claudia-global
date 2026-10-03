@@ -2,7 +2,7 @@
  * HooksEditor component for managing Claude Code hooks configuration
  */
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Plus,
@@ -48,12 +48,15 @@ import { HooksManager } from "@/lib/hooksManager";
 import { api } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { handleError } from "@/lib/errorHandler";
+import { logger } from "@/lib/logger";
 import {
   HooksConfiguration,
   HookEvent,
   HookMatcher,
   HookCommand,
   HookTemplate,
+  HookEventFormat,
+  DirectHookEvent,
   COMMON_TOOL_MATCHERS,
   HOOK_TEMPLATES,
 } from "@/types/hooks";
@@ -66,7 +69,7 @@ interface HooksEditorProps {
   scope: "project" | "local" | "user";
   readOnly?: boolean;
   className?: string;
-  onChange?: (hasChanges: boolean, getHooks: () => HooksConfiguration) => void;
+  onChange?: (hasChanges: boolean, getHooks: () => Record<string, unknown>) => void;
   hideActions?: boolean;
 }
 
@@ -158,6 +161,17 @@ export const HooksEditor: React.FC<HooksEditorProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [hooks, setHooks] = useState<HooksConfiguration>({});
+  /**
+   * On-disk shape each matcher-less event was loaded in (legacy flat vs the
+   * nested form used by Claude Code >= 2.x). Saving round-trips this so that an
+   * existing configuration is never rewritten into a shape the installed CLI
+   * cannot read.
+   */
+  const directEventFormatRef = useRef<Record<DirectHookEvent, HookEventFormat>>({
+    Notification: "nested",
+    Stop: "nested",
+    SubagentStop: "nested",
+  });
 
   // Events with matchers (tool-related) - memoized to prevent unnecessary re-renders
   const matcherEvents = React.useMemo(() => ["PreToolUse", "PostToolUse"] as const, []);
@@ -220,7 +234,17 @@ export const HooksEditor: React.FC<HooksEditorProps> = ({
       api
         .getHooksConfig(scope, projectPath)
         .then((config) => {
-          setHooks(config || {});
+          // Normalize both the legacy flat shape and the nested shape written by
+          // Claude Code >= 2.x. A malformed configuration must never take the
+          // whole editor (and the app) down.
+          try {
+            const normalized = HooksManager.normalizeConfig(config);
+            directEventFormatRef.current = normalized.directEventFormat;
+            setHooks(normalized.hooks);
+          } catch (normalizeError) {
+            logger.error("[HooksEditor] Failed to normalize hooks config:", normalizeError);
+            setHooks({});
+          }
           setHasUnsavedChanges(false);
         })
         .catch(async (err) => {
@@ -291,36 +315,30 @@ export const HooksEditor: React.FC<HooksEditorProps> = ({
     setHasUnsavedChanges(true);
   }, [editableHooks]);
 
+  /**
+   * Convert the editable state back into the on-disk hooks shape.
+   *
+   * Matcher-less events are written in the same shape they were loaded in, and
+   * handler fields the editor does not understand are passed through untouched.
+   */
+  const buildHooksConfig = (): Record<string, unknown> =>
+    HooksManager.serializeConfig(
+      {
+        PreToolUse: editableHooks.PreToolUse,
+        PostToolUse: editableHooks.PostToolUse,
+        Notification: editableHooks.Notification,
+        Stop: editableHooks.Stop,
+        SubagentStop: editableHooks.SubagentStop,
+      },
+      directEventFormatRef.current
+    );
+
   // Notify parent of changes
   useEffect(() => {
     if (onChange) {
-      const getHooks = () => {
-        const newHooks: HooksConfiguration = {};
-
-        // Handle matcher events
-        matcherEvents.forEach((event) => {
-          const matchers = editableHooks[event];
-          if (matchers.length > 0) {
-            newHooks[event] = matchers.map(({ id: _id, expanded: _expanded, ...matcher }) => ({
-              ...matcher,
-              hooks: matcher.hooks.map(({ id: _hookId, ...hook }) => hook),
-            }));
-          }
-        });
-
-        // Handle direct events
-        directEvents.forEach((event) => {
-          const commands = editableHooks[event];
-          if (commands.length > 0) {
-            newHooks[event] = commands.map(({ id: _id, ...hook }) => hook);
-          }
-        });
-
-        return newHooks;
-      };
-
-      onChange(hasUnsavedChanges, getHooks);
+      onChange(hasUnsavedChanges, buildHooksConfig);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasUnsavedChanges, editableHooks, onChange, directEvents, matcherEvents]);
 
   // Save function to be called explicitly
@@ -329,30 +347,15 @@ export const HooksEditor: React.FC<HooksEditorProps> = ({
 
     setIsSaving(true);
 
-    const newHooks: HooksConfiguration = {};
-
-    // Handle matcher events
-    matcherEvents.forEach((event) => {
-      const matchers = editableHooks[event];
-      if (matchers.length > 0) {
-        newHooks[event] = matchers.map(({ id: _id, expanded: _expanded, ...matcher }) => ({
-          ...matcher,
-          hooks: matcher.hooks.map(({ id: _hookId, ...hook }) => hook),
-        }));
-      }
-    });
-
-    // Handle direct events
-    directEvents.forEach((event) => {
-      const commands = editableHooks[event];
-      if (commands.length > 0) {
-        newHooks[event] = commands.map(({ id: _id, ...hook }) => hook);
-      }
-    });
+    const newHooks = buildHooksConfig();
 
     try {
       await api.updateHooksConfig(scope, newHooks, projectPath);
-      setHooks(newHooks);
+      // Re-read through the normalizer so the editor keeps working on the
+      // canonical shape (and picks up the format that was just written).
+      const normalized = HooksManager.normalizeConfig(newHooks);
+      directEventFormatRef.current = normalized.directEventFormat;
+      setHooks(normalized.hooks);
       setHasUnsavedChanges(false);
     } catch (error) {
       await handleError("Failed to save hooks:", { context: error });
@@ -536,11 +539,18 @@ export const HooksEditor: React.FC<HooksEditorProps> = ({
             fixed[event] = matchers.map((matcher) => ({
               ...matcher,
               matcher: (matcher.matcher || "").trim() || ".*", // Fix empty patterns
-              hooks: matcher.hooks.map((hook) => ({
-                ...hook,
-                command: hook.command.trim() || "echo 'Hook triggered'", // Fix empty commands
-              })).filter((hook) => hook.command.trim()), // Remove truly empty commands
-            })).filter((matcher) => matcher.hooks.length > 0); // Remove matchers with no valid commands
+              hooks: (matcher.hooks ?? [])
+                .map((hook) => {
+                  // Handlers without a command (e.g. Claude Code "prompt"/"agent"
+                  // handlers) are left untouched so they are not destroyed.
+                  if (typeof hook.command !== "string") return hook;
+                  return {
+                    ...hook,
+                    command: hook.command.trim() || "echo 'Hook triggered'", // Fix empty commands
+                  };
+                })
+                .filter((hook) => typeof hook.command !== "string" || hook.command.trim().length > 0),
+            })).filter((matcher) => (matcher.hooks ?? []).length > 0); // Remove matchers with no valid commands
           }
         });
         
@@ -548,10 +558,15 @@ export const HooksEditor: React.FC<HooksEditorProps> = ({
         directEvents.forEach((event) => {
           const commands = fixed[event] as EditableHookCommand[];
           if (commands) {
-            fixed[event] = commands.map((cmd) => ({
-              ...cmd,
-              command: cmd.command.trim() || "echo 'Command executed'", // Fix empty commands
-            })).filter((cmd) => cmd.command.trim()); // Remove truly empty commands
+            fixed[event] = commands
+              .map((cmd) => {
+                if (typeof cmd.command !== "string") return cmd;
+                return {
+                  ...cmd,
+                  command: cmd.command.trim() || "echo 'Command executed'", // Fix empty commands
+                };
+              })
+              .filter((cmd) => typeof cmd.command !== "string" || cmd.command.trim().length > 0);
           }
         });
         
@@ -711,23 +726,35 @@ export const HooksEditor: React.FC<HooksEditorProps> = ({
                 )}
               </div>
 
-              {matcher.hooks.length === 0 ? (
+              {(matcher.hooks ?? []).length === 0 ? (
                 <p className="text-sm text-muted-foreground">{t.hooks.noCommandsAdded}</p>
               ) : (
                 <div className="space-y-2">
-                  {matcher.hooks.map((hook) => (
+                  {(matcher.hooks ?? []).map((hook) => (
                     <div key={hook.id} className="space-y-2">
                       <div className="flex items-start gap-2">
                         <div className="flex-1 space-y-2">
-                          <Textarea
-                            placeholder={t.hooks.commandPlaceholder}
-                            value={hook.command || ""}
-                            onChange={(e) =>
-                              updateCommand(event, matcher.id, hook.id, { command: e.target.value })
-                            }
-                            disabled={readOnly}
-                            className="font-mono text-sm min-h-[80px]"
-                          />
+                          {typeof hook.command === "string" ? (
+                            <Textarea
+                              placeholder={t.hooks.commandPlaceholder}
+                              value={hook.command}
+                              onChange={(e) =>
+                                updateCommand(event, matcher.id, hook.id, { command: e.target.value })
+                              }
+                              disabled={readOnly}
+                              className="font-mono text-sm min-h-[80px]"
+                            />
+                          ) : (
+                            /* Handler types the editor cannot edit (e.g. Claude
+                               Code "prompt"/"agent" handlers) are shown read-only
+                               and written back unchanged. */
+                            <div className="rounded-md border bg-muted/40 p-2 text-xs font-mono break-all">
+                              <span className="not-italic font-sans text-muted-foreground mr-1">
+                                {hook.type}:
+                              </span>
+                              {JSON.stringify(hook)}
+                            </div>
+                          )}
 
                           <div className="flex items-center gap-4">
                             <div className="flex items-center gap-2">
@@ -795,13 +822,24 @@ export const HooksEditor: React.FC<HooksEditorProps> = ({
     <Card key={command.id} className="p-4 space-y-2">
       <div className="flex items-start gap-2">
         <div className="flex-1 space-y-2">
-          <Textarea
-            placeholder={t.hooks.commandPlaceholder}
-            value={command.command || ""}
-            onChange={(e) => updateDirectCommand(event, command.id, { command: e.target.value })}
-            disabled={readOnly}
-            className="font-mono text-sm min-h-[80px]"
-          />
+          {typeof command.command === "string" ? (
+            <Textarea
+              placeholder={t.hooks.commandPlaceholder}
+              value={command.command}
+              onChange={(e) => updateDirectCommand(event, command.id, { command: e.target.value })}
+              disabled={readOnly}
+              className="font-mono text-sm min-h-[80px]"
+            />
+          ) : (
+            /* Non-command handler (Claude Code "prompt"/"agent"): read-only,
+               written back unchanged. */
+            <div className="rounded-md border bg-muted/40 p-2 text-xs font-mono break-all">
+              <span className="not-italic font-sans text-muted-foreground mr-1">
+                {command.type}:
+              </span>
+              {JSON.stringify(command)}
+            </div>
+          )}
 
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">

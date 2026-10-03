@@ -6,12 +6,18 @@
  */
 
 /**
- * Represents a shell command to execute as part of a hook
+ * Represents a single hook handler as written by Claude Code
+ *
+ * Claude Code supports several handler types. `command` handlers run a shell
+ * command; newer versions also support `prompt` and `agent` handlers which have
+ * no `command` field. Unknown fields are preserved so that configurations the
+ * editor does not understand survive a load/save round trip untouched.
  */
 export interface HookCommand {
-  type: "command";
-  command: string;
+  type: string; // "command" | "prompt" | "agent" | ...
+  command?: string; // Present for type === "command"
   timeout?: number; // Optional timeout in seconds (default: 60)
+  [key: string]: unknown;
 }
 
 /**
@@ -24,6 +30,11 @@ export interface HookMatcher {
 
 /**
  * Complete hooks configuration for different Claude Code events
+ *
+ * This is the *normalized* in-memory shape used by the editor: tool events are
+ * matcher lists, the remaining events are flat handler lists. Use
+ * `HooksManager.normalizeConfig` / `HooksManager.serializeConfig` to convert to
+ * and from the on-disk shapes.
  */
 export interface HooksConfiguration {
   PreToolUse?: HookMatcher[];
@@ -31,6 +42,35 @@ export interface HooksConfiguration {
   Notification?: HookCommand[];
   Stop?: HookCommand[];
   SubagentStop?: HookCommand[];
+}
+
+/**
+ * One entry of a hook event array exactly as stored in settings.json
+ *
+ * Claude Code >= 2.x nests handlers in `hooks: [...]`, while older versions put
+ * the handler fields (`type`, `command`, `timeout`) directly on the entry.
+ * Both shapes are accepted when reading.
+ */
+export interface RawHookEntry {
+  matcher?: string;
+  hooks?: RawHookEntry[];
+  type?: string;
+  command?: string;
+  timeout?: number;
+  [key: string]: unknown;
+}
+
+/** On-disk shape used for events that take no matcher */
+export type HookEventFormat = "nested" | "flat";
+
+/** Events whose handlers take no matcher */
+export type DirectHookEvent = "Notification" | "Stop" | "SubagentStop";
+
+/** Result of normalizing a raw settings.json hooks block */
+export interface NormalizedHooksConfig {
+  hooks: HooksConfiguration;
+  /** On-disk shape each direct event was stored in, so saving round-trips it */
+  directEventFormat: Record<DirectHookEvent, HookEventFormat>;
 }
 
 /**
