@@ -116,13 +116,21 @@ pub struct ClaudeModelInfo {
 /// Get Claude models by spawning an interactive PTY session and sending /model command.
 #[tauri::command]
 pub async fn get_claude_models(app: AppHandle) -> Result<Vec<ClaudeModelInfo>, String> {
+    use crate::commands::agents::{AgentDb, get_enabled_environment_variables};
+
     log::info!("[get_claude_models] Fetching models via interactive PTY...");
     
     let claude_path = find_claude_binary(&app)?;
+
+    // The CLI needs the configured provider environment (a relay endpoint or a
+    // third-party token) to report the models that are actually available.
+    let env_vars = get_enabled_environment_variables(app.state::<AgentDb>())
+        .await
+        .unwrap_or_default();
     
     // Run the PTY interaction in a blocking task
     let models = tokio::task::spawn_blocking(move || {
-        fetch_models_via_pty(&claude_path)
+        fetch_models_via_pty(&claude_path, &env_vars)
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -140,7 +148,10 @@ pub async fn get_claude_models(app: AppHandle) -> Result<Vec<ClaudeModelInfo>, S
 }
 
 /// Fetch models using PTY to interact with Claude CLI
-fn fetch_models_via_pty(claude_path: &str) -> Result<Vec<ClaudeModelInfo>, String> {
+fn fetch_models_via_pty(
+    claude_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<Vec<ClaudeModelInfo>, String> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
@@ -157,6 +168,13 @@ fn fetch_models_via_pty(claude_path: &str) -> Result<Vec<ClaudeModelInfo>, Strin
         .map_err(|e| format!("Failed to open PTY: {}", e))?;
     
     let mut cmd = CommandBuilder::new(claude_path);
+
+    // Apply the environment variables configured in the app so that the model
+    // list reflects the user's actual provider.
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+
     // Start in current directory
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
@@ -781,6 +799,13 @@ fn create_sidecar_command(
 
     // Set working directory
     sidecar_cmd = sidecar_cmd.current_dir(project_path);
+
+    // Forward the environment variables configured in the app (ANTHROPIC_BASE_URL,
+    // ANTHROPIC_AUTH_TOKEN, ...). Without this the bundled CLI silently falls back
+    // to the official endpoint on macOS.
+    for (key, value) in env_vars {
+        sidecar_cmd = sidecar_cmd.env(key, value);
+    }
 
     // Set environment variables for Windows shell compatibility
     if cfg!(target_os = "windows") {

@@ -1076,11 +1076,18 @@ pub async fn execute_agent(
         "--dangerously-skip-permissions".to_string(),
     ];
 
+    // Environment variables configured in the app (ANTHROPIC_BASE_URL,
+    // ANTHROPIC_AUTH_TOKEN, ...) must reach the CLI here too, otherwise agent
+    // runs silently fall back to the official endpoint.
+    let env_vars = get_enabled_environment_variables(db.clone())
+        .await
+        .unwrap_or_default();
+
     // Execute based on whether we should use sidecar or system binary
     if should_use_sidecar(&claude_path) {
-        spawn_agent_sidecar(app, run_id, agent_id, agent.name.clone(), args, project_path, task, execution_model, db, registry).await
+        spawn_agent_sidecar(app, run_id, agent_id, agent.name.clone(), args, project_path, task, execution_model, db, registry, env_vars).await
     } else {
-        spawn_agent_system(app, run_id, agent_id, agent.name.clone(), claude_path, args, project_path, task, execution_model, db, registry).await
+        spawn_agent_system(app, run_id, agent_id, agent.name.clone(), claude_path, args, project_path, task, execution_model, db, registry, env_vars).await
     }
 }
 
@@ -1094,6 +1101,7 @@ fn create_agent_sidecar_command(
     app: &AppHandle,
     args: Vec<String>,
     project_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<tauri_plugin_shell::process::Command, String> {
     let mut sidecar_cmd = app
         .shell()
@@ -1117,6 +1125,13 @@ fn create_agent_sidecar_command(
             sidecar_cmd = sidecar_cmd.env(&key, &value);
         }
     }
+
+    // Forward the environment variables configured in the app
+    for (key, value) in env_vars {
+        debug!("Setting custom env var for agent sidecar: {}={}", key, value);
+        sidecar_cmd = sidecar_cmd.env(key, value);
+    }
+
     Ok(sidecar_cmd)
 }
 
@@ -1125,12 +1140,19 @@ fn create_agent_system_command(
     claude_path: &str,
     args: Vec<String>,
     project_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
 ) -> Command {
     let mut cmd = create_command_with_env(claude_path);
 
     // Add all arguments
     for arg in args {
         cmd.arg(arg);
+    }
+
+    // Forward the environment variables configured in the app
+    for (key, value) in env_vars {
+        debug!("Setting custom env var for agent run: {}={}", key, value);
+        cmd.env(key, value);
     }
 
     cmd.current_dir(project_path)
@@ -1153,9 +1175,10 @@ async fn spawn_agent_sidecar(
     execution_model: String,
     db: State<'_, AgentDb>,
     registry: State<'_, crate::process::ProcessRegistryState>,
+    env_vars: std::collections::HashMap<String, String>,
 ) -> Result<i64, String> {
     // Build the sidecar command
-    let sidecar_cmd = create_agent_sidecar_command(&app, args, &project_path)?;
+    let sidecar_cmd = create_agent_sidecar_command(&app, args, &project_path, &env_vars)?;
 
     // Spawn the process
     info!("🚀 Spawning Claude sidecar process...");
@@ -1338,9 +1361,10 @@ async fn spawn_agent_system(
     execution_model: String,
     db: State<'_, AgentDb>,
     registry: State<'_, crate::process::ProcessRegistryState>,
+    env_vars: std::collections::HashMap<String, String>,
 ) -> Result<i64, String> {
     // Build the command
-    let mut cmd = create_agent_system_command(&claude_path, args, &project_path);
+    let mut cmd = create_agent_system_command(&claude_path, args, &project_path, &env_vars);
 
     // Spawn the process
     info!("🚀 Spawning Claude system process...");
