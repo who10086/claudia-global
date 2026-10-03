@@ -581,6 +581,28 @@ fn decode_project_path(encoded: &str) -> String {
     encoded.replace('-', "/")
 }
 
+/// Returns true when `value` is a canonical UUID (8-4-4-4-12 hex digits).
+///
+/// Claude Code only accepts UUID session ids for `--resume` and rejects anything
+/// else with `Provided value "..." is not a valid UUID` before producing any
+/// output. Not every `*.jsonl` file in a project directory is a real session:
+/// subagent transcripts (`agent-<hash>.jsonl`) and fork copies created by older
+/// versions of this app are not resumable, so they must not be offered as
+/// sessions.
+fn is_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            *byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    })
+}
+
 /// Extracts the first valid user message from a JSONL file
 fn extract_first_user_message(jsonl_path: &PathBuf) -> (Option<String>, Option<String>) {
     let file = match fs::File::open(jsonl_path) {
@@ -956,6 +978,14 @@ pub async fn list_projects() -> Result<Vec<Project>, String> {
                     {
                         if let Some(session_id) = session_path.file_stem().and_then(|s| s.to_str())
                         {
+                            // Only UUID-named transcripts are resumable sessions.
+                            if !is_uuid(session_id) {
+                                log::debug!(
+                                    "Skipping non-session jsonl file in project directory: {}",
+                                    session_path.display()
+                                );
+                                continue;
+                            }
                             sessions.push(session_id.to_string());
                         }
                     }
@@ -1019,6 +1049,16 @@ pub async fn get_project_sessions(project_id: String) -> Result<Vec<Session>, St
 
         if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
             if let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) {
+                // Subagent transcripts (agent-*.jsonl) and other artifacts are not
+                // resumable Claude Code sessions - see `is_uuid`.
+                if !is_uuid(session_id) {
+                    log::debug!(
+                        "Skipping non-session jsonl file in project directory: {}",
+                        path.display()
+                    );
+                    continue;
+                }
+
                 // Get file creation time
                 let metadata = fs::metadata(&path)
                     .map_err(|e| format!("Failed to read file metadata: {}", e))?;
@@ -1644,6 +1684,18 @@ pub async fn resume_claude_code(
         project_path,
         model
     );
+
+    // Claude Code only accepts UUID session ids for --resume. Passing anything
+    // else (a subagent transcript, a fork created by an older version, ...) makes
+    // the CLI exit immediately with
+    // `Provided value "..." is not a valid UUID` and no output at all.
+    if !is_uuid(&session_id) {
+        return Err(format!(
+            "\"{}\" is not a resumable Claude Code session: session ids must be UUIDs. \
+             Pick a real conversation from the project's session list.",
+            session_id
+        ));
+    }
 
     // Get enabled environment variables from database
     let env_vars = match get_enabled_environment_variables(app.state::<AgentDb>()).await {
@@ -3084,4 +3136,39 @@ pub async fn delete_session(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_uuid;
+
+    /// Issue #25: only UUID-named transcripts may be offered as sessions, because
+    /// `claude --resume <id>` rejects anything else with
+    /// `Provided value "..." is not a valid UUID` and produces no output.
+    #[test]
+    fn accepts_canonical_uuids() {
+        assert!(is_uuid("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_uuid("550E8400-E29B-41D4-A716-446655440000"));
+        assert!(is_uuid("a56545f0-d508-4633-a8bf-76462688f57f"));
+    }
+
+    #[test]
+    fn rejects_non_session_file_stems() {
+        // Subagent transcripts written by Claude Code
+        assert!(!is_uuid("agent-a07ec99"));
+        assert!(!is_uuid("agent-a07c37ca9a6e55aad"));
+        // Fork ids created by older versions of this app
+        assert!(!is_uuid("1755000000000-abc123def"));
+    }
+
+    #[test]
+    fn rejects_near_misses() {
+        assert!(!is_uuid(""));
+        assert!(!is_uuid("550e8400e29b41d4a716446655440000")); // no separators
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544000")); // 35 chars
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-4466554400000")); // 37 chars
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544zzzz")); // non-hex
+        assert!(!is_uuid("550e8400_e29b_41d4_a716_446655440000")); // wrong separator
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544000 ")); // trailing space
+    }
 }

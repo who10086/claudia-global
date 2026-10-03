@@ -47,6 +47,24 @@ import { handleError, handleApiError, handleValidationError } from "@/lib/errorH
 import { audioNotificationManager } from "@/lib/audioNotification";
 import { useTrackEvent, useComponentMetrics, useWorkflowTracking } from "@/hooks";
 
+/**
+ * Generates a UUID v4 for a new session.
+ *
+ * Session ids must be UUIDs because Claude Code rejects anything else when
+ * resuming (`Provided value "..." is not a valid UUID`).
+ */
+function generateSessionUuid(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  // Fallback for webviews without crypto.randomUUID
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 interface ClaudeCodeSessionProps {
   /**
    * Optional session to resume (when clicking from SessionList)
@@ -1261,7 +1279,9 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
       setIsLoading(true);
       setError(null);
 
-      const newSessionId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      // Forked sessions must keep a UUID id: Claude Code refuses to resume
+      // anything else (`Provided value "..." is not a valid UUID`).
+      const newSessionId = generateSessionUuid();
       await api.forkFromCheckpoint(
         forkCheckpointId,
         effectiveSession.id,
